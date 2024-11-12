@@ -1,0 +1,38 @@
+Bootstrap: docker
+From: continuumio/miniconda3
+
+%files
+    . /opt/gwasqc
+
+%environment
+    export PATH=/opt/conda/envs/gwas_qc/bin:$PATH
+
+%post
+    # Install system dependencies
+    apt-get update && apt-get install -y git build-essential
+
+    # Install mamba in the base environment
+    conda install -y -c conda-forge mamba
+
+    # Navigate to the project directory
+    cd /opt/gwasqc
+
+    # Set up the conda environment using environment.yml
+    mamba env create -f environment.yml
+
+    # Activate the conda environment
+    . /opt/conda/etc/profile.d/conda.sh
+    conda activate gwas_qc
+
+    # Install Poetry in the conda environment
+    mamba install -y -c conda-forge poetry=1.5.1
+
+    # Configure Poetry to use the conda environment's Python and not create its own virtual environment
+    poetry config virtualenvs.create false
+
+    # Install Python dependencies using Poetry into the conda environment
+    poetry install --no-root -vvv > /opt/gwasqc/poetry_install.log 2>&1 || {
+        echo "Poetry install failed";
+        cat /opt/gwasqc/poetry_install.log;
+        exit 1;
+    }
