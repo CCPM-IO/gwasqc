@@ -28,7 +28,13 @@ From: continuumio/miniconda3
     mamba install -y -c conda-forge poetry=1.5.1
 
     # Configure Poetry to use the conda environment's Python and not create its own virtual environment
-    poetry config virtualenvs.create false
+    poetry config virtualenvs.create false\
+
+    # Clear the Poetry cache
+    poetry cache clear pypi --all
+
+    # Remove the lock file to force fresh dependency resolution
+    rm -f poetry.lock
 
     # Install Python dependencies using Poetry into the conda environment
     poetry install --no-root -vvv > /opt/gwasqc/poetry_install.log 2>&1 || {
@@ -36,3 +42,6 @@ From: continuumio/miniconda3
         cat /opt/gwasqc/poetry_install.log;
         exit 1;
     }
+
+    # Force installation of older version of PuLP to avoid breaking snakemake
+    pip install PuLP==2.7.0
