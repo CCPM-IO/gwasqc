@@ -9,6 +9,7 @@ packages = [{include = "gwas_qc"}]
 [tool.poetry.dependencies]
 python = ">=3.9,<3.11"
 snakemake = "^7.32.4"
+PuLP = "^2.7.0" # Newer versions break snakemake; newer snakemake needs Python>=3.11
 black = "^23.11.0"
 isort = "^5.12.0"
 pandas = "^1.3.5"
