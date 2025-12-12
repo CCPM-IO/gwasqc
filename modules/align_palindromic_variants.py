@@ -6,10 +6,9 @@ from typing import List, Optional
 
 import attr
 import defopt
+import filter_gwas
 import numpy as np
 import polars as pl
-
-import filter_gwas
 
 # pylint: disable=C0301 # line too long
 # pylint: disable=R0914 # too many local variables
@@ -38,6 +37,8 @@ def harmonize(
     :param col_map: Class of columns
     """
     list_of_results: List[AlignmentResults] = []
+    
+
     # Check for variants with exact alignment (ref=ref & alt=alt)
     exact: AlignmentResults = align_alleles(
         gnomad_df=gnomad_pl,
@@ -60,7 +61,8 @@ def harmonize(
         id_column="Flipped_Allele_ID",
         method="inverse_match",
     )
-    if inverse.aligned_and_merged is not None:
+    
+    if (inverse.aligned_and_merged is not None) and (exact.aligned_and_merged is not None):
         results = handle_palindromic_variants(
             exact_pl=exact.aligned_and_merged,
             inverse_pl=inverse.aligned_and_merged,
@@ -70,19 +72,21 @@ def harmonize(
         inverse.aligned_and_merged = results.inverse
         list_of_results.append(exact)
         list_of_results.append(inverse)
-    else:
+    if (inverse.aligned_and_merged is not None) and (exact.aligned_and_merged is None):
+        list_of_results.append(inverse)
+    if (inverse.aligned_and_merged is None) and (exact.aligned_and_merged is not None):
         list_of_results.append(exact)
 
     # Concatenate results
     list_of_dfs: List[pl.DataFrame] = []
     for result in list_of_results:
         df = result.aligned_and_merged
-        if df is not None:
+        if not df.is_empty():
             list_of_dfs.append(df)
 
     stacked_pl = pl.concat(list_of_dfs, how="diagonal")
 
-    # Calculate Aligned Columns
+    # If needed flip beta and allele frequency
     stacked_pl = stacked_pl.with_columns(
         pl.when(
             (
@@ -91,8 +95,8 @@ def harmonize(
                 )
             )
         )
-        .then(-1 * pl.col(col_map.beta) if pl.col(col_map.beta) is not None else np.NaN)
-        .otherwise(pl.col(col_map.beta))
+        .then(-1 * pl.col(col_map.beta) if col_map.beta is not None else np.NaN)
+        .otherwise(pl.col(col_map.beta) if col_map.beta is not None else np.NaN)
         .alias("Aligned_Beta")
     )
 
@@ -113,14 +117,81 @@ def harmonize(
     exact_align = stacked_pl.filter(pl.col("Alignment_Method") == "exact_match")[
         col_map.palindromic_flag
     ].sum()
+    inverse_align = stacked_pl.filter(pl.col("Alignment_Method") == "inverse_match")[
+        col_map.palindromic_flag
+    ].sum()
+
     print(
-        f"\nPalindromic Summary:\nTotal aligned palindromic variants: {sum(stacked_pl[col_map.palindromic_flag])}\nTotal aligned palindromic varinats with method 'exact_match': {exact_align}\nTotal aligned palindromic varinats with allele frequencies between 0.4 and 0.6: {sum(stacked_pl[col_map.palindromic_af_flag])}\n"
+        f"\nPalindromic Summary:\nTotal aligned palindromic variants: {sum(stacked_pl[col_map.palindromic_flag])}/{sum(gwas_pl[col_map.palindromic_flag])}\nTotal aligned palindromic varinats with method 'exact_match': {exact_align}\nTotal aligned palindromic varinats with method 'inverse_match': {inverse_align}\nTotal aligned palindromic varinats with allele frequencies between 0.4 and 0.6: {sum(stacked_pl[col_map.palindromic_af_flag])}"
     )
 
-    # Write Abs(AF_study - AF_ref)
-    stacked_pl = stacked_pl.with_columns(
-        (abs(pl.col("AF") - pl.col("Aligned_AF"))).alias("ABS_DIF_AF")
+    # Calculate:
+    # Absolute difference in AF
+    # Fold change
+    # Alternate allele comparison
+    # AF-GWAS < 0.4 and AF-gnomAD > 0.6, AF-GWAS > 0.6 and AF-gnomAD < 0.4
+
+    stacked_pl = (
+        stacked_pl.with_columns(
+            (abs(pl.col("AF_gnomad") - pl.col("Aligned_AF"))).alias("ABS_DIF_AF")
+        )
+        .with_columns(((pl.col("AF_gnomad") / pl.col("Aligned_AF"))).alias("FOLD_CHANGE_AF"))
+        .with_columns(
+            (
+                pl.when(
+                    (
+                        ((abs((1 - pl.col("AF_gnomad")) - pl.col("Aligned_AF"))))
+                        < pl.col("ABS_DIF_AF")
+                    )
+                )
+                .then(1)
+                .otherwise(0)
+                .alias("GNOMAD_EAF_FLAG")
+            )
+        )
+        .with_columns(
+            (
+                pl.when(
+                    ((pl.col("AF_gnomad") < 0.4) & (pl.col("Aligned_AF") > 0.6))
+                    | ((pl.col("AF_gnomad") > 0.6) & (pl.col("Aligned_AF") < 0.4))
+                )
+                .then(1)
+                .otherwise(0)
+                .alias("4_6")
+            )
+        )
+        .with_columns(
+            (
+                pl.when(pl.col("4_6") == 1)
+                .then(pl.lit("4_6_af"))
+                .otherwise(
+                    (
+                        pl.when(pl.col("GNOMAD_EAF_FLAG") == 1)
+                        .then(pl.lit("alt_af"))
+                        .otherwise(
+                            pl.when((pl.col("FOLD_CHANGE_AF") > 2))
+                            .then(pl.lit("fold_change"))
+                            .otherwise(pl.lit("PASS"))
+                        )
+                    )
+                )
+                .alias("Potential_Strand_Flip")
+            )
+        )
+        .drop(["4_6", "GNOMAD_EAF_FLAG"])
     )
+
+    fold_change_count = (
+        stacked_pl.with_columns(
+            pl.when(pl.col("FOLD_CHANGE_AF") > 2).then(1).otherwise(0).alias("x")
+        )
+        .filter(x=1)
+        .shape[0]
+    )
+    print(
+        f"Total aligned palindromic varinats with a fold change greater than 2 (gnomad_af/gwas_af): {fold_change_count}"
+    )
+    
     return stacked_pl
 
 
@@ -161,17 +232,16 @@ def align_alleles(
         method: The descriptor for what alignemtn method is being tested
     """
     # Remove chr from both ID's if present
-    gnomad_df = gnomad_df.with_columns(pl.col("ID").str.replace("chr", "").alias("ID"))
+    gnomad_df = gnomad_df.with_columns((pl.col("ID_gnomad").str.replace("chr", "")).alias("ID_gnomad"))
 
     gwas_df = gwas_df.with_columns(
-        pl.col(id_column).str.replace("chr", "").alias(id_column)
+        (pl.col(id_column).str.replace("chr", "")).alias(id_column)
     )
 
     # Create sets of id columns and find overlap
-    gnomad_set: set = set(gnomad_df["ID"])
+    gnomad_set: set = set(gnomad_df["ID_gnomad"])
     gwas_set: set = set(gwas_df[id_column])
     aligned_set: set = gnomad_set & gwas_set
-    print(f"\n{len(aligned_set)} variants align to the reference via {method}")
 
     if len(aligned_set) > 0:
         # Filter gwas data for only aligned variants
@@ -185,7 +255,7 @@ def align_alleles(
         joined_df = aligned_df.join(
             gnomad_df,
             left_on=id_column,
-            right_on="ID",
+            right_on="ID_gnomad",
             how="left",
             suffix="_gnomad",
         )
@@ -207,11 +277,11 @@ def handle_palindromic_variants(
         col_map; Class of column names
     """
     exact_pl_subset = exact_pl.with_columns(
-        ABS_DIF_AF=abs((pl.col("AF") - pl.col(col_map.eaf)))
+        ABS_DIF_AF=abs((pl.col("AF_gnomad") - pl.col(col_map.eaf)))
     ).select(col_map.variant_id, "ABS_DIF_AF")
 
     inverse_pl_subset = inverse_pl.with_columns(
-        ABS_DIF_AF=abs((pl.col("AF") - (1 - pl.col(col_map.eaf))))
+        ABS_DIF_AF=abs((pl.col("AF_gnomad") - (1 - pl.col(col_map.eaf))))
     ).select(col_map.variant_id, "ABS_DIF_AF")
 
     joined = (
